@@ -1,9 +1,12 @@
-// server.js - UPDATED with Session-Based Tracking
+require('dotenv').config();
+// server.js - UPDATED with Session-Based Tracking and Name Field
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
+const axios = require('axios');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -33,7 +36,7 @@ const userSchema = new mongoose.Schema({
   userId: { type: String, required: true, unique: true },
   phoneNumber: { type: String, required: true },
   language: { type: String, default: 'english' },
-name: { 
+  name: { 
     type: String, 
     required: true,
     trim: true 
@@ -81,7 +84,7 @@ const gameSessionSchema = new mongoose.Schema({
   gameName: { 
     type: String, 
     required: true,
-    enum: ['choose-items', 'count-them', 'size-comparison', 'learn-numbers']
+    enum: ['choose-items','Choose Items','Shape Matching Game', 'Size Comparison','Count Them','count-them', 'size-comparison', 'learn-numbers']
   },
   startedAt: { 
     type: Date, 
@@ -222,6 +225,8 @@ const User = mongoose.model('User', userSchema);
 const Tutor = mongoose.model('Tutor', tutorSchema);
 const GameSession = mongoose.model('GameSession', gameSessionSchema);
 const LevelAttempt = mongoose.model('LevelAttempt', levelAttemptSchema);
+const Attempt = mongoose.model('Attempt', attemptSchema);
+
 // ===== JWT AUTH MIDDLEWARE =====
 function authenticateTutor(req, res, next) {
   const authHeader = req.headers.authorization;
@@ -256,6 +261,162 @@ app.get('/api/health', (req, res) => {
 });
 
 // ===== USER ROUTES (unchanged) =====
+
+const otpStore = new Map();
+
+app.post('/api/auth/send-otp', async (req, res) => {
+  const { phoneNumber } = req.body;
+  
+  if (!phoneNumber || phoneNumber.length < 10) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Valid phone number required' 
+    });
+  }
+  
+  try {
+    // Generate 4-digit OTP
+    const otp = Math.floor(1000 + Math.random() * 9000).toString();
+    
+    // Create session ID
+    const sessionId = crypto.randomBytes(16).toString('hex');
+    
+    // Store OTP with expiry (5 minutes)
+    otpStore.set(sessionId, {
+      phoneNumber,
+      otp,
+      expiresAt: Date.now() + 5 * 60 * 1000
+    });
+    
+    // For development: Log OTP to console
+    console.log(`📱 OTP for ${phoneNumber}: ${otp} (Session: ${sessionId})`);
+    
+    // Check if WhatsApp credentials are configured
+    if (!process.env.WHATSAPP_PHONE_ID || !process.env.WHATSAPP_ACCESS_TOKEN) {
+      console.warn('⚠️  WhatsApp credentials not configured. Using development mode.');
+      
+      // In development, return success without actually sending
+      return res.json({ 
+        success: true, 
+        sessionId,
+        message: 'OTP sent successfully',
+        // Remove this in production - only for development testing
+        devOtp: process.env.NODE_ENV === 'development' ? otp : undefined
+      });
+    }
+    
+    // Send WhatsApp message using WhatsApp Business API
+    await axios.post(
+      `https://graph.facebook.com/v18.0/${process.env.WHATSAPP_PHONE_ID}/messages`,
+      {
+        messaging_product: "whatsapp",
+        to: phoneNumber,
+        type: "template",
+        template: {
+          name: "otp_sheru",
+          language: { code: "en" },
+          components: [
+            {
+              type: "body",
+              parameters: [
+                {
+                  type: "text",
+                  text: otp
+                }
+              ]
+            },
+            {
+              type: "button",
+              sub_type: "url",
+              index: "0",
+              parameters: [
+                {
+                  type: "text",
+                  text: otp
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    res.json({ 
+      success: true, 
+      sessionId,
+      message: 'OTP sent successfully via WhatsApp'
+    });
+  } catch (error) {
+    console.error('WhatsApp API Error:', error.response?.data || error.message);
+    
+    // If WhatsApp fails, still return success in development
+    if (process.env.NODE_ENV === 'development') {
+      return res.json({ 
+        success: true, 
+        sessionId: crypto.randomBytes(16).toString('hex'),
+        message: 'OTP sent (dev mode)',
+        devOtp: Math.floor(1000 + Math.random() * 9000).toString()
+      });
+    }
+    
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to send OTP. Please try again.' 
+    });
+  }
+});
+
+// Verify OTP endpoint
+app.post('/api/auth/verify-otp', (req, res) => {
+  const { sessionId, otp } = req.body;
+  
+  if (!sessionId || !otp) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Session ID and OTP required' 
+    });
+  }
+  
+  const session = otpStore.get(sessionId);
+  
+  if (!session) {
+    return res.json({ 
+      success: false, 
+      message: 'Invalid or expired session. Please request a new OTP.' 
+    });
+  }
+  
+  if (Date.now() > session.expiresAt) {
+    otpStore.delete(sessionId);
+    return res.json({ 
+      success: false, 
+      message: 'OTP expired. Please request a new one.' 
+    });
+  }
+  
+  if (session.otp !== otp) {
+    return res.json({ 
+      success: false, 
+      message: 'Invalid OTP. Please try again.' 
+    });
+  }
+  
+  // OTP verified successfully
+  otpStore.delete(sessionId);
+  console.log(`✅ OTP verified successfully for ${session.phoneNumber}`);
+  
+  res.json({ 
+    success: true, 
+    phoneNumber: session.phoneNumber,
+    message: 'OTP verified successfully'
+  });
+});
 
 app.post('/api/user/register', async (req, res) => {
   try {
@@ -605,80 +766,94 @@ app.post('/api/tutor/register', async (req, res) => {
   }
 });
 
-// NEW: Tutor dashboard - Latest 5 + First session
-app.get('/api/tutor/:tutorId/student/:userId/dashboard',authenticateTutor, async (req, res) => {
+// NEW: Tutor dashboard - Latest 5 + First session (UPDATED to include student names)
+app.get('/api/tutor/:tutorId/student/:userId/dashboard', authenticateTutor, async (req, res) => {
   try {
-
     const { tutorId, userId } = req.params;
-    const { gameId } = req.query;
 
-    const query = { 
+    const baseQuery = { 
       userId, 
       tutorRefId: tutorId,
       completedAt: { $ne: null }
     };
+
+    // Get all unique games this student has played
+    const games = await GameSession.distinct('gameId', baseQuery);
     
-    if (gameId) query.gameId = gameId;
+    const allSessionsWithLevels = [];
 
-    // Latest 5 sessions
-    const latestSessions = await GameSession
-      .find(query)
-      .sort({ startedAt: -1 })
-      .limit(5)
-      .lean();
+    // For each game, get latest 5 sessions + first session
+    for (const gameId of games) {
+      const gameQuery = { ...baseQuery, gameId };
 
-    // First ever session
-    const firstSession = await GameSession
-      .findOne(query)
-      .sort({ startedAt: 1 })
-      .lean();
+      // Latest 5 sessions for this game
+      const latestSessions = await GameSession
+        .find(gameQuery)
+        .sort({ startedAt: -1 })
+        .limit(5)
+        .lean();
 
-    // Combine and deduplicate
-    const sessionIds = new Set();
-    const allSessions = [];
-    
-    latestSessions.forEach(session => {
-      sessionIds.add(session.sessionId);
-      allSessions.push(session);
-    });
-    
-    if (firstSession && !sessionIds.has(firstSession.sessionId)) {
-      allSessions.push({ ...firstSession, isFirstEver: true });
-    } else if (firstSession) {
-      const idx = allSessions.findIndex(s => s.sessionId === firstSession.sessionId);
-      if (idx !== -1) allSessions[idx].isFirstEver = true;
-    }
+      // First ever session for this game
+      const firstSession = await GameSession
+        .findOne(gameQuery)
+        .sort({ startedAt: 1 })
+        .lean();
 
-    // Fetch levels
-    const sessionIdsArray = Array.from(sessionIds);
-    if (firstSession && !sessionIds.has(firstSession.sessionId)) {
-      sessionIdsArray.push(firstSession.sessionId);
-    }
-
-    const allLevels = await LevelAttempt
-      .find({ sessionId: { $in: sessionIdsArray } })
-      .sort({ levelNumber: 1 })
-      .lean();
-
-    // Group levels by session
-    const levelsBySession = {};
-    allLevels.forEach(level => {
-      if (!levelsBySession[level.sessionId]) {
-        levelsBySession[level.sessionId] = [];
+      // Combine and deduplicate
+      const sessionIds = new Set();
+      const gameSessions = [];
+      
+      latestSessions.forEach(session => {
+        sessionIds.add(session.sessionId);
+        gameSessions.push(session);
+      });
+      
+      if (firstSession && !sessionIds.has(firstSession.sessionId)) {
+        gameSessions.push({ ...firstSession, isFirstEver: true });
+        sessionIds.add(firstSession.sessionId);
+      } else if (firstSession) {
+        const idx = gameSessions.findIndex(s => s.sessionId === firstSession.sessionId);
+        if (idx !== -1) gameSessions[idx].isFirstEver = true;
       }
-      levelsBySession[level.sessionId].push(level);
-    });
 
-    const sessionsWithLevels = allSessions.map(session => ({
-      ...session,
-      levels: levelsBySession[session.sessionId] || []
-    }));
+      // Fetch levels for these sessions
+      const sessionIdsArray = Array.from(sessionIds);
+      const levels = await LevelAttempt
+        .find({ sessionId: { $in: sessionIdsArray } })
+        .sort({ levelNumber: 1 })
+        .lean();
+
+      // Group levels by session
+      const levelsBySession = {};
+      levels.forEach(level => {
+        if (!levelsBySession[level.sessionId]) {
+          levelsBySession[level.sessionId] = [];
+        }
+        levelsBySession[level.sessionId].push(level);
+      });
+
+      // Add levels to sessions
+      gameSessions.forEach(session => {
+        session.levels = levelsBySession[session.sessionId] || [];
+        allSessionsWithLevels.push(session);
+      });
+    }
+
+    // Sort all sessions by startedAt (most recent first), but keep first sessions marked
+    allSessionsWithLevels.sort((a, b) => {
+      // First sessions come after their game's recent sessions
+      if (a.gameId === b.gameId) {
+        return new Date(b.startedAt) - new Date(a.startedAt);
+      }
+      return new Date(b.startedAt) - new Date(a.startedAt);
+    });
 
     res.json({
       success: true,
       data: {
-        sessions: sessionsWithLevels,
-        totalSessions: sessionsWithLevels.length
+        sessions: allSessionsWithLevels,
+        totalSessions: allSessionsWithLevels.length,
+        gamesPlayed: games.length
       }
     });
   } catch (error) {
@@ -691,7 +866,7 @@ app.get('/api/tutor/:tutorId/student/:userId/dashboard',authenticateTutor, async
   }
 });
 
-// Updated tutor students list (with new session-based stats)
+// Updated tutor students list (FIXED: Now includes name field)
 app.get('/api/tutor/:tutorId/students', authenticateTutor, async (req, res) => {
   try {
     const tutorId = req.params.tutorId;
@@ -737,6 +912,7 @@ app.get('/api/tutor/:tutorId/students', authenticateTutor, async (req, res) => {
       return {
         userId: student.userId,
         phoneNumber: student.phoneNumber,
+        name: student.name, // ✅ NOW INCLUDED
         language: student.language,
         age: student.age,
         class: student.class,
@@ -766,7 +942,7 @@ app.get('/api/tutor/:tutorId/students', authenticateTutor, async (req, res) => {
 });
 
 // Tutor statistics
-app.get('/api/tutor/:tutorId/stats',authenticateTutor, async (req, res) => {
+app.get('/api/tutor/:tutorId/stats', authenticateTutor, async (req, res) => {
   try {
     const tutorId = req.params.tutorId;
 
